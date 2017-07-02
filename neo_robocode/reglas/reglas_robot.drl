@@ -1,0 +1,372 @@
+////////////////////////////////////////////////////////////////////////
+// SOLO
+////////////////////////////////////////////////////////////////////////
+ 
+package neo_robocode
+ 
+import neo_robocode.*;
+import robocode.*;
+import robocode.ScannedRobotEvent;
+import java.awt.geom.Point2D;
+import java.util.HashMap;
+import robocode.util.Utils;
+import java.util.Iterator;
+import java.util.ArrayList;
+import java.util.Arrays;
+ 
+ 
+// Consultar a acao a ser executada
+query "consulta_acciones"
+  accion: Accion()
+end
+ 
+////////////////////////////////////////////////////////////////////////
+// STRUCTS
+////////////////////////////////////////////////////////////////////////
+ 
+declare Target
+   name: String
+   distance: double
+   damage: double
+   bearingRadians : double
+   headingRadians : double
+   velocity : double
+end
+ 
+declare Destination
+	x: double
+	y: double
+end
+ 
+declare EnemyData
+	x : double
+	y: double
+	energy : double
+	damage : double
+end
+ 
+ 
+////////////////////////////////////////////////////////////////////////
+// FUNCTIONS
+////////////////////////////////////////////////////////////////////////
+ 
+// Funcao para avaliar o risco de um possivel destino
+function double evalDestinationRisk(Point2D.Double d, Neo robo) {
+	double risk = 0;
+ 
+	// Iterator para a minha lista de inimigos
+	Iterator enemiesIterator = robo._enemies.values().iterator();
+	
+	while (enemiesIterator.hasNext()) {
+		
+		// Pego os dados do proximo inimigo na lista
+		EnemyData ed = (EnemyData)enemiesIterator.next();
+		
+		// Pega o quadrado da distancia do ponto d para um ponto especifico
+		Point2D.Double point_ed = new Point2D.Double(ed.getX(), ed.getY());
+		double distSq = point_ed.distanceSq(d);
+		int closer = 0;
+		
+		// Novo iterator para percorrer a lista de inimigos
+		Iterator enemiesIterator2 = robo._enemies.values().iterator();
+		
+		
+		while (enemiesIterator2.hasNext()) {
+			EnemyData ed2 = (EnemyData)enemiesIterator2.next();
+			Point2D.Double point_ed2 = new Point2D.Double(ed2.getX(), ed2.getY());
+			if (point_ed.distanceSq(point_ed2) < distSq) {
+				// se o quadrado da distancia para esse inimigo for menor que a disancia antes definida, diz que está chegando mais perto 
+				closer++;
+			}
+		}
+		
+		// Aumenta o risco de um valor especifico 
+		risk += Math.max(0.5, Math.min(ed.getEnergy() / robo.getEnergy(), 2))
+			* (1 + Math.abs(Math.cos(Auxiliar.absoluteBearing(robo._myLocation, d) - 
+					Auxiliar.absoluteBearing(robo._myLocation, point_ed))))
+			/ closer
+			/ distSq
+			/ (200000 + d.distanceSq(
+				robo.getBattleFieldWidth() / 2, robo.getBattleFieldHeight() / 2));
+	}
+	
+	// faz uma iteracao e aumenta o risco de um valor especifico 
+	for (int x = 1; x < 6; x++) {
+		try {
+			risk *= 1 + (500 / x / 
+				((Point2D.Double)robo._recentLocations.get(x * 10))
+					.distanceSq(d));
+		} catch (Exception ex) { }
+	}
+	// Retorna o risco do destino calculado.
+	return risk;
+}
+ 
+// Funcao para calcular a projecao de um ponto
+function Point2D.Double project(Point2D.Double sourceLocation, 
+        double angle, double length) {
+ 
+        return new Point2D.Double(sourceLocation.x + Math.sin(angle) * length,
+            sourceLocation.y + Math.cos(angle) * length);
+ }
+ 
+////////////////////////////////////////////////////////////////////////
+// REGLAS
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra para inicializar o target, se ele nao existir
+rule "init target"
+	salience 150
+when
+	not (exists Target())
+then
+	Target initTarget = new Target();
+	initTarget.setDistance(Double.POSITIVE_INFINITY);
+	initTarget.setDamage(0.0);
+	initTarget.setBearingRadians(0.0);
+	initTarget.setHeadingRadians(0.0);
+	initTarget.setVelocity(0.0);
+	insert(initTarget);
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra para tratar de acoes do mesmo tipo
+rule "depurar acciones del mismo tipo"
+	salience 30
+when
+	$accion1: Accion($tipo: tipo, $prioridad1: prioridad)
+	$accion2: Accion(tipo==$tipo, $prioridad2: prioridad)
+	eval ($prioridad1 > $prioridad2)
+then
+    retract($accion2);     
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra: Quando não encontra nenhum robo, fica girando o radar
+rule "sin robots a la vista -> giro completo del radar"
+	salience 30
+when
+	$estado : EstadoRobot( others  > 1 )
+then
+	insert (new Accion(Accion.GIRAR_RADAR_DER, 360, 1));
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra: Quando não encontra nenhum robo e so tem mais um robo na arena, fica girando o radar
+rule "sin robots a la vista -> giro completo del radar2"
+	salience 30
+when
+	$estado : EstadoRobot( others  == 1 )
+	not (exists ScannedRobotEvent())
+then
+	insert (new Accion(Accion.GIRAR_RADAR_DER, 360, 1));
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+ // Regra: Quando encontra um robo, aponta na direcao dele
+rule "aponta para a vitima"
+	salience 30
+when
+	not (exists Target())
+	$victimaEscaneada: ScannedRobotEvent($direcao: bearing, $distancia: distance)
+	$status: EstadoRobot(others == 1)
+then	
+	double anguloRelativoRadar = Auxiliar.anguloRelativo($status.getHeading(), $status.getRadarHeading()); // Descontar el desplazam. actual del radar  
+	insert(new Accion(Accion.GIRAR_RADAR_DER, ($direcao - anguloRelativoRadar), 1));
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra: Quando existe o target, sigo ele com o radar
+rule "segue robo com radar"
+	salience 30
+when
+	$datosVictima: Target ($nombreVictima: name)
+   	$status : EstadoRobot()
+   	$victimaEscaneada: ScannedRobotEvent(name == $nombreVictima)
+then
+	double anguloRelativoRadar = Auxiliar.anguloRelativo($status.getHeading(), $status.getRadarHeading()); // Descontar el desplazam. actual del radar  
+	insert(new Accion(Accion.GIRAR_RADAR_DER, ($victimaEscaneada.getBearing() - anguloRelativoRadar), 1));
+end 
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra: Atualizo a minha posicao no vetor de posices recentes
+rule "update location"
+	salience 100
+when
+	$robo : Neo()
+	$status : EstadoRobot()
+then
+	Point2D.Double myLocation = $robo._myLocation = new Point2D.Double($robo.getX(), $robo.getY());	
+	$robo._recentLocations.add(0, myLocation);
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra: Atualizo os inimigos e o target
+rule "update enemies"
+	salience 140
+when
+	$event : ScannedRobotEvent()
+	$robo : Neo()
+	$target : Target()
+then
+	EnemyData eData = new EnemyData();
+	
+	// Calcula os dados relativos ao robo escaneado
+	double angle = Auxiliar.anguloAbsoluto($event.getBearing(),$robo.getHeading());
+	eData.setX(Auxiliar.calcularX($robo._myLocation.getX(), 
+								  angle, 
+								  $event.getDistance() ));
+	eData.setY(Auxiliar.calcularY($robo._myLocation.getY(), 
+								  angle, 
+								  $event.getDistance() ));	  
+	eData.setEnergy($event.getEnergy());
+	
+	// Se o robo escaneado ja esta na minha lista de inimigos, pego ele
+	EnemyData scannedData;
+	if ($robo._enemies.get($event.getName()) != null) {
+		
+		scannedData = (EnemyData)$robo._enemies.get($event.getName());
+	} else {
+		scannedData = new EnemyData();
+		scannedData.setDamage(0.0);
+	}
+	
+	// Coloco o novo robo na minha lista de inimigos
+	$robo._enemies.put($event.getName(),eData);
+	
+	// Troco o target se necessario
+	if (($event.getDistance() < $target.getDistance() 
+		|| $event.getName().equals( $target.getName()) 
+		|| scannedData.getDamage() > $target.getDamage())&&(!($event.getName().startsWith("neo_robocode")))) {
+			
+		$target.setDistance($event.getDistance());
+		$target.setName($event.getName());
+		$target.setBearingRadians($event.getBearingRadians());
+		$target.setHeadingRadians($event.getHeadingRadians());
+		$target.setVelocity($event.getVelocity());
+				
+		if(scannedData.getDamage() > $target.getDamage()) {
+			$target.setDamage(scannedData.getDamage());
+		}
+	}
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra para mirar e atirar
+rule "set gun and shoot"
+	salience 90
+when
+	$robo : Neo()
+	$status : EstadoRobot()	
+	$target : Target()
+then
+	EnemyData targetData;
+	targetData = (EnemyData)$robo._enemies.get($target.getName());
+	
+	try {
+			
+		// Gira a arma de um ângulo definido em radianos
+		Point2D.Double target_location = new Point2D.Double(targetData.getX(), targetData.getY());
+		Point2D.Double my_location = new Point2D.Double($robo.getX(), $robo.getY());
+		double destino = Auxiliar.absoluteBearing(my_location, target_location);
+		double base = $robo.getGunHeadingRadians();
+		double angle = Utils.normalRelativeAngle(destino - base);	
+		insert(new Accion(Accion.GIRAR_CANON_DER, angle, 1));  
+	} catch (NullPointerException ex) { }
+ 
+	// Define o poder de fogo baseado na energia
+	$robo.firepower = 3 - ((20 - $status.getEnergy()) / 6);;
+	insert(new Accion(Accion.DISPARAR,$robo.firepower, 1));
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra: quando acerto um inimigo com uma bala, atualizo a lista de inimigos
+rule "bullet hit -> update enemies list"
+	salience 140
+when
+	$event : BulletHitEvent()
+	$robo : Neo()
+	$target : Target()
+then
+	EnemyData eData = new EnemyData();								  
+	eData.setEnergy($event.getEnergy() - $robo.firepower);
+	eData.setDamage(eData.getDamage() + $robo.firepower);
+	
+	$robo._enemies.put($event.getName(),eData);
+	
+	if ($event.getName().equals( $target.getName())) {
+		$target.setDamage(eData.getDamage());
+	}
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra: quando um robo morre, removo ele da minha lista de inimigos
+rule "robot death -> remove from enemies list"
+	salience 140
+when
+	$event : RobotDeathEvent()
+	$robo : Neo()
+	$target : Target()	
+then
+	$robo._enemies.remove($event.getName());
+	$target.setDistance(Double.POSITIVE_INFINITY);
+end
+ 
+////////////////////////////////////////////////////////////////////////
+ 
+// Regra para atualizar o movimento do robo
+rule "update_movement"
+	salience 80
+when
+	$robo : Neo()
+	$status : EstadoRobot()	
+	$target : Target()	
+then
+	double bestRisk;
+	try {
+		// Chama a função de melhor risco baseado no destino
+		bestRisk = evalDestinationRisk($robo._destination,$robo) * .85;
+	} catch (NullPointerException ex) {
+		// Se não conseguir, define o melhor risco como infinito
+		bestRisk = Double.POSITIVE_INFINITY;
+	}
+	
+	try {
+		for (double d = 0; d < $robo.TWO_PI; d += 0.1) {
+						
+			Point2D.Double newDest = project($robo._myLocation, d,
+				Math.min($target.getDistance(), 100 +  Math.random() * 200));
+			
+		   	// Calcula o risco referente ao novo destino
+			double thisRisk = evalDestinationRisk(newDest,$robo);
+ 
+ 
+			if ($robo._fieldRect.contains(newDest) && thisRisk < bestRisk) {
+				bestRisk = thisRisk;
+				$robo._destination = newDest;
+			}
+		}
+		
+		// Calcula o ângulo relativo referente à nova localização
+		double angle = Utils.normalRelativeAngle(
+				Auxiliar.absoluteBearing($robo._myLocation, $robo._destination) - 
+				$robo.getHeadingRadians());
+		
+		// Gira o corpo do robô desse ângulo
+		insert(new Accion(Accion.GIRAR_TANQUE_DER,Math.toDegrees((Math.tan(angle))), 1));
+ 
+		// Anda nessa direção
+		insert(new Accion(Accion.AVANZAR,(Math.cos(angle) * Double.POSITIVE_INFINITY), 1));
+		
+	} catch (NullPointerException ex) { }
+end
